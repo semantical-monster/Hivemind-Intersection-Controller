@@ -4,6 +4,12 @@
 
 ---
 
+
+https://github.com/user-attachments/assets/a4886fc3-448c-4f9c-a8dc-cdc1f4b76a4d
+
+
+---
+
 ## The Problem
 
 Traditional traffic lights are blunt instruments. They stop entire approach directions for fixed durations — even when only one car needs to cross, even when opposing movements could safely overlap, even when a left-turner and a right-turner from opposite directions have paths that never come close to touching.
