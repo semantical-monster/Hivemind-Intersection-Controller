@@ -1,149 +1,144 @@
-# hivemind
+# Hivemind Intersection Controller
 
-> A centralized autonomous intersection controller — simulation prototype exploring whether a "hive mind" coordinating all vehicles through a shared conflict zone can outperform conventional traffic lights.
+A fully autonomous intersection controller simulation built in Python. No traffic lights, no stop signs — a centralized AI continuously schedules every vehicle's precise arrival time at the intersection box and modulates their speed so they glide through without stopping.
 
----
-
-
-https://github.com/user-attachments/assets/a4886fc3-448c-4f9c-a8dc-cdc1f4b76a4d
-
+![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![numpy](https://img.shields.io/badge/numpy-required-orange) ![matplotlib](https://img.shields.io/badge/matplotlib-required-orange)
 
 ---
 
-## The Problem
+## What It Does
 
-Traditional traffic lights are blunt instruments. They stop entire approach directions for fixed durations — even when only one car needs to cross, even when opposing movements could safely overlap, even when a left-turner and a right-turner from opposite directions have paths that never come close to touching.
+Vehicles approach from all four directions across six lanes per road (three ingress, three egress). The hive mind knows where every vehicle is, how fast it's moving, and what conflicts exist between crossing paths. Instead of reacting to vehicles at the stop line, it plans several seconds ahead and assigns each vehicle a conflict-free time slot — then the vehicle simply adjusts its cruise speed to arrive exactly on time.
 
-The question this project asks:
-
-> What if every vehicle approaching an intersection reported its position, speed, and intended movement to a centralized controller — and that controller continuously solved for the maximum number of vehicles that could safely traverse the intersection simultaneously?
-
-That is the hive mind.
-
----
-
-## How It Works
-
-### Road Layout
-
-Each approach direction (N/S/E/W) has **6 lanes** — 3 ingress, 3 egress — centered on the road axis:
-
-```
--3W  -2.5W -1.5W -0.5W  │  +0.5W +1.5W +2.5W  +3W
- |  [R-in][ST-in][LT-in] │ [LT-out][ST-out][R-out] |
-        ingress (3)       ↑        egress (3)
-                     gold centreline
-```
-
-Vehicles self-sort into the correct lane by intention — right-turners, straights, and left-turners each have their own independent queue. A right-turner never waits behind a stopped left-turner.
-
-### Conflict Model
-
-All 12 possible movements (4 directions × 3 intentions) were audited geometrically — 80 Bezier path samples per movement, minimum separation computed for all 66 pairs:
-
-- **16 genuine conflicts** (paths come within 2.0m of each other)
-- **50 safe pairs** (paths stay separated by ≥ 2.0m throughout the box)
-
-This replaces hand-reasoned compatibility rules with verified geometry. Every decision the hive mind makes is grounded in actual path data.
-
-### The Control Algorithm
-
-Every `SCHED_DT` seconds, and immediately whenever a vehicle enters or exits the box:
-
-1. **Identify ready movements** — any lane whose head vehicle is within `READY_DIST` metres and has no conflicting vehicle currently in the box
-2. **Find the maximum conflict-free subset** — exhaustive search over combinations of ready movements (N ≤ 12, 2¹² = 4096 max subsets, runs in < 2ms)
-3. **Grant GO** to that subset. Everything else holds.
-4. **Additive pass** — any ready movement compatible with the entire current GO set gets added, even if it wasn't in the primary subset
-5. **Anti-starvation** — movements not seen GO in `STARVATION_LIMIT` seconds force a switch; `MAX_HOLDOUT` is an absolute hard cap
-
-No phases. No scoring. No weights. Just: *who's ready, and what's the largest safe set?*
-
-### Vehicle Physics
-
-| State | Behavior |
-|-------|----------|
-| **GO** (head of lane) | Cruise at `SPEED_DESIRED`, enter box when `dist_in ≤ 0` |
-| **HOLD** (head of lane) | Cruise at full speed until physics require braking, then stop at `STOP_LINE` |
-| **Follower** | Cruise freely until within `FOLLOW_COMFORT` metres of leader, then blend toward leader speed |
-| **In box** | Accelerate back to `SPEED_DESIRED` throughout traversal |
-| **Egress** | Constant `SPEED_DESIRED` in assigned lane — no speed variation, no overtaking |
-
-The car-following model is intentionally **distance-gated**: following vehicles only react to the vehicle ahead when within 18m. Beyond that they cruise freely at the speed limit. This prevents a stopped head vehicle from cascading a slow-speed wave back through the entire approach queue.
-
-### Platooning
-
-When a movement is in GO and the next vehicle in that lane is also approaching, the hive mind keeps that movement active — allowing the follower to enter without re-evaluating the phase. Same-movement vehicles platoon through at `PLATOON_GAP` seconds apart.
-
----
-
-## Performance
-
-Measured over 60-second simulations, ~0.88 vehicles/second arrival rate:
-
-| Metric | Result |
-|--------|--------|
-| Avg induced delay | **~0.8s** |
-| Max induced delay | **~5.3s** |
-| Zero-delay throughput | **~50%** of vehicles |
-| Platoon events | **6–11** per run |
-
-*Induced delay = actual box entry time minus what it would have been at free-flow with no other traffic.*
-
----
-
-## Running It
-
-```bash
-pip install -r requirements.txt
-python hivemind.py
-```
-
-Close the pyplot window to write `hivemind_log.csv` with a per-vehicle event breakdown and summary stats.
-
-### Key Tunables
-
-```python
-ARRIVAL_RATE    = 0.22   # vehicles/s/approach — increase to stress-test
-SIM_DURATION    = 60.0   # seconds
-SPEED_DESIRED   = 12.0   # m/s (~27 mph)
-STARVATION_LIMIT = 2.5   # seconds before a waiting movement forces a switch
-MAX_HOLDOUT     = 4.0    # hard cap — no movement waits longer than this
-READY_DIST      = 40.0   # metres — how close before a lane is "ready"
-```
+At normal traffic loads this means **no stops, no hard braking, no waiting at a red light**. A vehicle 50 metres out that needs to wait four seconds just drives at ~12 mph instead of ~27 mph and arrives right as the box clears. When unexpected backlogs form, the controller detects them and switches to a high-throughput burst mode that rapidly clears queues as tight platoons.
 
 ---
 
 ## Architecture
 
+### Normal Mode — Predictive Arrival-Time Scheduling
+
+The scheduler runs every 0.12 seconds and rebuilds a conflict-free slot table from scratch:
+
+1. For each lane's head vehicle, compute the natural arrival time at current speed
+2. Sort all movements by effective priority — earliest natural arrival minus a starvation bonus that grows with wait time and queue depth, preventing any movement from being indefinitely blocked by right-turners
+3. Walk the list greedily: assign each movement the earliest time window that doesn't overlap with any geometrically conflicting movement already scheduled
+4. Compatible movements (e.g. N→S and S→N, which cross paths safely) get concurrent slots — they go simultaneously
+5. Broadcast `t_arrive` to each vehicle; followers in the same lane get back-to-back slots for smooth platooning
+
+Each vehicle then computes every physics tick:
+
 ```
-hivemind.py
-├── Geometry          lane entry/exit coordinates, Bezier box paths
-├── Conflict model    50 geometrically-verified safe movement pairs
-├── HiveMind          max concurrent movement controller
-│   ├── update()      ready detection → max_safe_subset → GO set
-│   ├── Additive      opportunistically add compatible movements
-│   └── Anti-starve   STARVATION_LIMIT + MAX_HOLDOUT enforcement
-├── Vehicle           dataclass with approach/box/egress state machine
-├── step()            physics tick — kinematics, box traversal, spawning
-└── Animation         matplotlib real-time visualization
+v_needed = dist_to_front / (t_arrive - now)
+v_needed = clamp(v_needed, V_MIN=3.0 m/s, V_MAX=12.96 m/s)
+```
+
+A gentle acceleration/deceleration envelope (`ACCEL_MAX = 2.5 m/s²`, `DECEL_MAX = 4.0 m/s²`) is applied so speed changes are gradual and never abrupt.
+
+### Flush Mode — Maximum Concurrent Throughput
+
+Triggered automatically when any single lane reaches **≥ 6 vehicles queued**. At that depth, the predictive scheduler's slot-pushing logic starts to cascade delays. Flush mode bypasses slot scheduling entirely:
+
+1. Find the largest geometrically conflict-free set of movements that have vehicles ready
+2. Signal all of them **GO** simultaneously — vehicles cruise to the box at full speed
+3. Schedule their followers in tight back-to-back slots (headway × 0.35 instead of full headway)
+4. Re-evaluate every scheduler tick so new concurrent movements are added the moment they become safe
+5. Anti-starvation: any movement that hasn't entered the box in 3.5 seconds gets forced to the front of the next GO set
+6. Exit back to normal mode when all queues drop to ≤ 3 vehicles
+
+The HUD shows `⚡ FLUSH` or `  normal` in real time so you can watch the mode switch during heavy traffic.
+
+### Safety Backstop
+
+Both modes share a final physical safety gate at the box edge. The front bumper position is tracked directly — a vehicle can only enter when its front bumper reaches the box edge AND no conflicting vehicle is in the box or committed to entering this same physics tick (`tick_reserved`). This is the ground truth; the scheduler is an optimization layer on top of it.
+
+---
+
+## Road & Vehicle Geometry
+
+All dimensions are real-world scale:
+
+| Parameter | Value | Imperial |
+|---|---|---|
+| Lane width | 3.66 m | 12 ft |
+| Lanes per road | 6 (3 ingress + 3 egress) | — |
+| Intersection box half-size | 11.0 m | ~36 ft |
+| Vehicle width | 2.44 m | 8 ft |
+| Vehicle length | 4.27 m | 14 ft |
+| Approach length | 90.0 m | ~295 ft |
+| Stop line clearance | 0.61 m | 2 ft |
+
+Vehicles are rendered as oriented 8×14 ft rectangles that rotate smoothly with their heading. During box traversal the heading is computed from the Bézier tangent so vehicles visually track their curve through the intersection.
+
+Lane markings are dashed grey lines at each **boundary** between lanes (not centrelines), matching real road striping. A gold centreline divides ingress from egress halves. Background is dark asphalt (`#1c1c1e`).
+
+---
+
+## Conflict Model
+
+All 12 possible movements (4 approaches × 3 turn types) were geometrically verified. Bézier paths through the box were sampled at 80 points and minimum separations computed. The result: **50 safe pairs** (paths that never come within 2 m of each other) and **16 conflicting pairs** (separation < 0.11 m — essentially crossing paths).
+
+The conflict check is O(1) via a frozen set lookup against the verified safe pairs — fast enough to run thousands of times per second without impacting frame rate.
+
+---
+
+## Performance
+
+At default arrival rate (0.22 veh/s per approach ≈ 0.88 veh/s total):
+
+- Average induced delay: **~1.6 seconds**
+- Maximum observed delay: **~12 seconds** (rare, during random arrival clusters)
+- Box utilization: ~85%
+- Flush mode engagement: 0%
+
+At rate 0.25 veh/s per approach:
+
+- Average induced delay: **~2.4 seconds**
+- Flush mode engages briefly during random spikes: ~5%
+
+At rate 0.35 veh/s per approach (heavy traffic):
+
+- Average induced delay: **~6 seconds**
+- Flush mode: ~55% of the time — dual-mode hybrid in action
+
+At rate 0.50 veh/s per approach the intersection is at or above theoretical saturation — straights alone require ~82% of available box time — so delays grow unboundedly regardless of algorithm.
+
+---
+
+## Tunable Parameters
+
+All in the `TUNABLES` block at the top of `hivemind.py`:
+
+```python
+ARRIVAL_RATE  = 0.22    # vehicles/s/approach — try 0.25–0.35 for heavier load
+SPEED_DESIRED = 12.0    # m/s (~27 mph) free-flow speed
+V_MIN         = 3.0     # m/s minimum modulation speed before stopping
+HEADWAY       = 0.55    # seconds minimum gap between consecutive box entries
+FLUSH_Q       = 6       # queue depth to enter flush mode
+FLUSH_EXIT_Q  = 3       # queue depth to exit flush mode (hysteresis)
+MAX_HOLDOUT   = 3.5     # seconds max starvation time in flush mode
+TURN_P        = {"S": 0.55, "L": 0.25, "R": 0.20}  # turn distribution
 ```
 
 ---
 
-## What This Is (And Isn't)
+## Usage
 
-This is a **simulation prototype**, not a production control system. It demonstrates the control concept and validates that maximum-concurrent-movement scheduling outperforms naive phase-based approaches. A real deployment would require:
+```bash
+pip install numpy matplotlib
+python hivemind.py
+```
 
-- V2X communication infrastructure
-- Sub-100ms round-trip latency between vehicles and controller
-- Sensor fusion for position/speed verification
-- Safety-certified conflict model validation
-- Graceful degradation for non-connected vehicles
-
-The scheduling algorithm itself — find the max conflict-free set of ready movements and grant them GO simultaneously — is the transferable idea.
+Press **Q** to quit. On close the simulation writes `hivemind_log.csv` with a full event log including per-vehicle induced delay, entry time, movement, and mode (normal/FLUSH).
 
 ---
 
-## Stack
+## Dependencies
 
-`Python` · `NumPy` · `Matplotlib` · `Combinatorics` · `Control Systems` · `Autonomous Vehicles`
+- Python 3.8+
+- numpy
+- matplotlib
+
+---
+
+*Author: semantical-monster*
